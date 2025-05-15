@@ -12,7 +12,123 @@ from tqdm import tqdm
 from copy import deepcopy
 from glob import glob
 import pickle
+import torch
+
+def load_pickle(file_path):
+    with open(file_path, 'rb') as f:
+        return pickle.load(f)
+
+def load_json(file_path):
+    with open(file_path, 'r') as f:
+        return json.load(f)
+
+def save_json(data, file_path):
+    with open(file_path, 'w') as f:
+        json.dump(data, f, indent=4)
+
+# def reverse_camera_directions(camera_poses):
+#     """
+#     Reverses the direction of camera poses by flipping the z-axis.
+    
+#     Args:
+#         camera_poses (list): List of 4x4 camera pose matrices
+        
+#     Returns:
+#         list: List of camera poses with reversed directions
+#     """
+#     reversed_poses = []
+    
+#     for pose in camera_poses:
+#         # Create a copy of the pose to avoid modifying the original
+#         reversed_pose = pose.copy()
+#         # Flip the z-axis direction (third column of rotation matrix)
+#         reversed_pose[:3, 2] = -reversed_pose[:3, 2]
+#         reversed_poses.append(reversed_pose)
+    
+#     return reversed_poses
+
+# Function to normalize camera poses to a smaller scale
+def normalize_camera_poses(camera_poses, scale_factor=1.0):
+    """
+    Normalize camera poses to a smaller scale while preserving their relative positions.
+    
+    Args:
+        camera_poses (list): List of camera pose matrices (4x4)
+        scale_factor (float): Scale factor to apply after normalization (default: 1.0)
+                             Smaller values make the visualization more compact
+    
+    Returns:
+        list: Normalized camera pose matrices
+    """
+    # Extract camera positions
+    positions = np.array([pose[:3, 3] for pose in camera_poses])
+    # Calculate the centroid
+    centroid = np.mean(positions, axis=0)
+    # Calculate the maximum distance from the centroid
+    max_distance = np.max(np.linalg.norm(positions - centroid, axis=1))
+    
+    # Create normalized poses
+    normalized_poses = []
+    for pose in camera_poses:
+        new_pose = pose.copy()
+        # Center the position
+        new_pose[:3, 3] = new_pose[:3, 3] - centroid
+        # Scale the position
+        new_pose[:3, 3] = new_pose[:3, 3] / max_distance * scale_factor
+        normalized_poses.append(new_pose)
+    
+    return normalized_poses
  
+def generate_gaussian_samples(mean, cov, n_samples=1000, device=None, dtype=None):
+    mean = torch.as_tensor(mean, device=device, dtype=dtype)
+    cov = torch.as_tensor(cov, device=device, dtype=dtype)
+    dim = mean.shape[0]
+    z = torch.randn(n_samples, dim, device=mean.device, dtype=mean.dtype)
+    L = torch.linalg.cholesky(cov)
+    x = z @ L.T + mean
+    return x
+
+def generate_gaussian_mixture_samples(means, covs, weights=None, n_samples=1000):
+    """
+    Generate samples from a Gaussian mixture model.
+    
+    Args:
+        means: List of mean vectors for each component
+        covs: List of covariance matrices for each component
+        weights: List of weights for each component (if None, equal weights are used)
+        n_samples: Number of samples to generate
+        
+    Returns:
+        samples: Generated samples (shape: (n_samples, D))
+    """
+    n_components = len(means)
+    
+    if weights is None: # equal weight
+        weights = torch.ones(n_components) / n_components
+    else:
+        # Normalize weights to sum to 1
+        weights = torch.tensor(weights) / torch.sum(torch.tensor(weights))
+        weights = weights.detach().clone()
+    
+    # Convert weights to numpy for multinomial sampling
+    weights_np = weights.cpu().numpy() if isinstance(weights, torch.Tensor) else weights
+    component_samples = np.random.multinomial(n_samples, weights_np)
+    
+    # Generate samples from each component
+    samples = []
+    for i in range(n_components):
+        if component_samples[i] > 0:
+            component_data = generate_gaussian_samples(means[i], covs[i], component_samples[i])
+            samples.append(component_data)
+    
+    # Combine and shuffle the samples
+    combined_samples = torch.cat(samples, dim=0)
+    
+    # Shuffle the samples
+    idx = torch.randperm(combined_samples.shape[0])
+    combined_samples = combined_samples[idx]
+    return combined_samples
+
 
 def find_index_for_camera_id(camera_ids, transforms_file):
     with open(transforms_file, 'r') as f:
@@ -108,16 +224,55 @@ def get_bbox_center_and_size(bbox):
     height = y2 - y1
     return (center_x, center_y), (width, height)
 
-def update_intrinsics(K, crop_x, crop_y, original_width, original_height):
-    """Update intrinsic matrix for the crop."""
-    # Create new intrinsic matrix
-    K_new = K.copy()
-    
-    if crop_x > 0:
+
+def get_mvhumannet_extrinsics(extrinsics_dict, scale):
+    """Get extrinsics for all cameras in a subject directory."""
+    extrinsics = create_transform_matrix(
+        extrinsics_dict['rotation'], extrinsics_dict['translation'],
+        homogeneous=False
+    )
+    extrinsics[:3, 3] = extrinsics[:3, 3] * scale
+    return extrinsics
+
+def update_intrinsics(K, crop_x=0, crop_y=0, scale=1, crop_first=True, padding_mode=False):
+    """Update intrinsic matrix for the crop and resizes."""
+    K_new = K.copy() if type(K) == np.ndarray else K.clone()
+    if crop_first:
+        K_new = update_intrinsics_crop(K, crop_x, crop_y, padding_mode)
+        if scale != 1:
+            K_new = update_intrinsics_resize(K_new, scale)
+    else:
+        if scale != 1:
+            K_new = update_intrinsics_resize(K, scale)
+        K_new = update_intrinsics_crop(K_new, crop_x, crop_y, padding_mode)
+    return K_new
+
+def update_intrinsics_crop(K, crop_x, crop_y, padding_mode=False):
+    """
+    Update intrinsic matrix for the crop.
+    If negative, then this is considered a padding (need to set padding_mode=True).
+    """
+    K_new = K.copy() if type(K) == np.ndarray else K.clone()
+    # padding mode enables negative "crops" to act as padding
+    if crop_x > 0 or padding_mode:
         K_new[0, 2] = K[0, 2] - crop_x
-    if crop_y > 0:
+    if crop_y > 0 or padding_mode:
         K_new[1, 2] = K[1, 2] - crop_y
+
+    # if padding_mode == False: # this would need to be positive
+    #     assert K_new[0, 2] >= 0, f"crop_x is negative: {K_new[0, 2]}"
+    #     assert K_new[1, 2] >= 0, f"crop_y is negative: {K_new[1, 2]}"
     
+    return K_new
+
+def update_intrinsics_resize(K, scale):
+    """Update intrinsic matrix for the resize."""
+    # Create new intrinsic matrix
+    K_new = K.clone() if type(K) == torch.Tensor else K
+    K_new[0, 0] = K[0, 0] * scale
+    K_new[1, 1] = K[1, 1] * scale
+    K_new[0, 2] = K[0, 2] * scale
+    K_new[1, 2] = K[1, 2] * scale
     return K_new
 
 
@@ -201,11 +356,7 @@ def process_image_crops_and_intrinsics(base_dir, image_id="0005", scale=0.5, hom
     # Load camera intrinsics
     intrinsics = load_json(os.path.join(base_dir, 'camera_intrinsics.json'))
     K = np.array(intrinsics['intrinsics'])
-    # scale focal lengths & optical center (to account for the existing downsample)
-    K[0, 0] = K[0, 0] * scale
-    K[1, 1] = K[1, 1] * scale
-    K[0, 2] = K[0, 2] * scale
-    K[1, 2] = K[1, 2] * scale
+    K = update_intrinsics(K, scale=scale)
     
     # Get all camera directories in annots
     annot_dir = os.path.join(base_dir, 'annots')
@@ -271,7 +422,11 @@ def process_image_crops_and_intrinsics(base_dir, image_id="0005", scale=0.5, hom
         )
 
         # Update intrinsics K post-crop
-        K_new = update_intrinsics(K, x1, y1, original_width, original_height)
+        print("OLD")
+        print(K)
+        K_new = update_intrinsics(K, x1, y1)
+        print("NEW")
+        print(K_new)
         
         results[camera] = {
             'crop': (x1, y1, x2, y2),
@@ -436,13 +591,15 @@ def create_transforms_json(
     background=None,
     invert_rotations=True,
     homogenous_image_size=None,
-    crop=True
+    crop=True,
+    normalize=False
 ):
     """
     Create transforms.json with cropped images and updated intrinsics.
     This function is geared towards SEVA forward inference.
 
     NOTE: assumes camera_extrinsics.json is w2c and inverts to c2w. If already c2w, then set invert_rotations=False.
+    If normalize is True, will normalize camera poses and update intrinsics accordingly.
     """
     # currently, subject_id isn't used, but when the dataset is decompressed, then it should be used for inference.
     # Load crop parameters
@@ -516,12 +673,29 @@ def create_transforms_json(
                 camera_data['camera_pos'] * np.array(camera_scale), # scale by camera_scale
                 homogeneous=homogeneous
             )
+            # NOTE: 'camera_pos' is essentially -R.T @ t, this skips some computation
         else:
             transform_matrix = create_transform_matrix(
                 camera_data['rotation'], # already c2w
                 camera_data['camera_pos'] * np.array(camera_scale), # scale by camera_scale
                 homogeneous=homogeneous
             )
+
+        # Rotate the transform_matrix 180 degrees around the z-axis
+        # Create a rotation matrix for 180 degrees (π radians) around z-axis
+        rotation_z_180 = np.array([
+            [1, 0, 0, 0],
+            [0, -1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # Apply the rotation to the transform matrix
+        transform_matrix = rotation_z_180 @ transform_matrix @ rotation_z_180
+
+        # transform_matrix[:, 0] = transform_matrix[:, 0]
+        # transform_matrix[:, 1] = transform_matrix[:, 1]
+        # transform_matrix[:, 2] = transform_matrix[:, 2]
 
         # Create frame entry
         crop_size = (crop_params[2] - crop_params[0], crop_params[3] - crop_params[1])
@@ -571,7 +745,13 @@ def create_transforms_json(
 
     if num_orbital_frames > 0: # append any test frames (blank)
         center = get_central_position(transforms) # get center before extending test points
-        orbital_transforms = generate_orbital_path(transforms, center, timestep=timestep, num_points=num_orbital_frames, radius=2000)
+        orbital_transforms = generate_orbital_path(
+            transforms, center,
+            timestep=timestep,
+            num_points=num_orbital_frames,
+            radius=2000,
+            direction_towards=center - np.array([0, 0, 650]) # TODO: un-hardcode this
+        )
         transforms["frames"].extend(orbital_transforms)
         create_black_frames(
             orbital_transforms,
@@ -758,7 +938,8 @@ def generate_orbital_extrinsics(
     radius, 
     num_points, 
     orbit_normal=[0, 0, 1], 
-    up_reference=[0, 0, 1]
+    up_reference=[0, 0, 1],
+    direction_towards=None
 ):
     """
     Generate extrinsic matrices (transformation matrices) for a circular orbital path around a center point.
@@ -769,6 +950,7 @@ def generate_orbital_extrinsics(
     - num_points: int - number of points in the orbit
     - orbit_normal: 3D list/array - defines the orientation of the orbital plane (default is Y-axis normal)
     - up_reference: 3D list/array - reference vector for camera up direction (default is Z-axis up)
+    - direction_towards: 3D list/array - if provided, cameras will look towards this point instead of center_point
     
     Returns:
     - List of 4x4 numpy arrays representing the transformation matrices at each orbital point
@@ -794,6 +976,9 @@ def generate_orbital_extrinsics(
     axis2 = np.cross(normal, axis1)
     axis2 = axis2 / np.linalg.norm(axis2)
     
+    # Determine the look-at point
+    look_at_point = np.array(direction_towards, dtype=np.float32) if direction_towards is not None else center
+    
     extrinsics = []
     
     for i in range(num_points):
@@ -804,12 +989,19 @@ def generate_orbital_extrinsics(
         # Position in world coordinates
         position = center + x * axis1 + y * axis2
         
-        # Calculate view direction (from position to center)
-        view_dir = center - position
+        # Calculate view direction (from position to look_at_point)
+        view_dir = look_at_point - position
         view_dir = view_dir / np.linalg.norm(view_dir)
         
         # Calculate right vector (in orbital plane)
         right = np.cross(view_dir, normal)
+        # If right vector is too small, find another perpendicular vector
+        if np.linalg.norm(right) < 1e-6:
+            # Find any vector perpendicular to view_dir
+            if not np.allclose(view_dir, [1, 0, 0]):
+                right = np.cross(view_dir, [1, 0, 0])
+            else:
+                right = np.cross(view_dir, [0, 1, 0])
         right = right / np.linalg.norm(right)
         
         # Recalculate up vector to ensure orthogonality
@@ -834,19 +1026,18 @@ def generate_orbital_extrinsics(
         transform = np.eye(4)
         transform[:3, 0] = right      
         transform[:3, 1] = up         
-        transform[:3, 2] = view_dir  
+        transform[:3, 2] = -view_dir  
         transform[:3, 3] = position   
-        
         extrinsics.append(transform)
     
     return extrinsics
 
-def generate_orbital_path(transforms, center, timestep, num_points, radius=1000):
+def generate_orbital_path(transforms, center, timestep, num_points, radius=1000, direction_towards=None):
     """ Generates orbital path around the center with num_points around it. Returns List of transforms."""
     # transforms to get average intrinscs
     avg_intrinsics = generate_average_intrinsics(transforms)
     # TODO: if radius is None, then use the length from the center to the closest cameras
-    orbital_extrinsics = generate_orbital_extrinsics(center, radius=radius, num_points=num_points)
+    orbital_extrinsics = generate_orbital_extrinsics(center, radius=radius, num_points=num_points, direction_towards=direction_towards)
 
     # create orbital transforms
     orbital_transforms = []
@@ -858,20 +1049,6 @@ def generate_orbital_path(transforms, center, timestep, num_points, radius=1000)
         })
 
     return orbital_transforms
-
-
-# def add_background(image, mask, background):
-#     """ Adds background to MASKED images and saves them to output_dir. """
-#     # NOTE: may not be needed anymore
-#     print('oof')
-#     background_resized = np.array(Image.fromarray(background).resize(image.shape[1::-1], Image.LANCZOS))
-#     print('oof2')
-#     combined_image = background_resized.copy()
-#     print(image.shape, mask[..., None].shape, background_resized.shape)
-#     print(combined_image[mask, :].shape)
-#     combined_image[mask, :] = (image * mask[..., None])
-#     return combined_image
-
 
 def apply_to_all_subjects(base_dir, function, *args, **kwargs):
     """
@@ -950,10 +1127,10 @@ def run_main(args):
         return
 
     # compute number of orbital frames (w.r.t seconds and fps)
-    generate_orbital_path = False
+    generate_path = False
     if args.num_orbital_frames <= -1:
         num_orbital_frames = int(args.seconds * args.fps)
-        generate_orbital_path = True
+        generate_path = True
     else:
         num_orbital_frames = args.num_orbital_frames
 
@@ -979,7 +1156,29 @@ def run_main(args):
         except Exception as e:
             os.rmdir(args.output_dir) 
             raise e
-        # transforms["camera_model"] = "OPENCV"
+
+        if args.normalize:
+            # Load all poses and intrinsics
+            poses = []
+            intrinsics = []
+            for frame in transforms["frames"]:
+                poses.append(np.array(frame["transform_matrix"]))
+                intrinsics.append(np.array([
+                    [frame["fl_x"], 0, frame["cx"]],
+                    [0, frame["fl_y"], frame["cy"]],
+                    [0, 0, 1]
+                ]))
+
+            # Normalize all poses and intrinsics together
+            normalized_poses = normalize_camera_poses(
+                poses, scale_factor=1.0)
+
+            # Update transforms.json with normalized values
+            for i, frame in enumerate(transforms["frames"]):
+                frame["transform_matrix"] = normalized_poses[i].tolist()
+                frame["fl_x"] = float(intrinsics[i][0, 0])
+                frame["fl_y"] = float(intrinsics[i][1, 1])
+                # cx, cy and image dimensions remain unchanged
         
         # if we apply any post-transformations (SEVA will handle this internally)
         # then we append a transformation matrix to apply to every matrix
@@ -996,7 +1195,7 @@ def run_main(args):
     if args.train_ids_path is not None:
         train_ids = match_camera_ids_to_index(args.train_ids_path, os.path.join(args.output_dir, 'transforms.json'), step=1)
 
-    if generate_orbital_path:
+    if generate_path:
         try: # this will error with --apply_split_only
             test_ids = list(range(len(transforms["frames"]) - num_orbital_frames, len(transforms["frames"])))
         except:
@@ -1052,6 +1251,9 @@ if __name__ == "__main__":
     parser.add_argument('--seconds', type=float, default=4.0, help="Number of seconds per path.")
     parser.add_argument('--fps', type=int, default=30, help="Frames per second.")
     parser.add_argument('--no_crop', action='store_false', help="If true, will not crop the images.")
+    parser.add_argument('--normalize', action='store_true', help="If true, will normalize the poses to a smaller scale.")
     
     args = parser.parse_args()
     run_main(args)
+
+

@@ -1,4 +1,6 @@
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib import cm
 from mpl_toolkits.mplot3d import proj3d
 import json
 import numpy as np
@@ -6,6 +8,219 @@ import pickle
 import argparse
 import os
 from preprocessing import get_central_position
+from typing import List, Dict
+import cv2
+from datetime import datetime
+from tqdm import tqdm
+
+def plot_distributions(samples):
+    """
+    Plot histograms comparing single Gaussian and Gaussian mixture distributions.
+    
+    Args:
+        samples: List of samples from different distributions.
+    """
+    # Create a figure with two subplots for comparing distributions
+    fig, axes = plt.subplots(1, len(samples), figsize=(12, 5))
+
+    # Define a list of colors for different distributions
+    colors = ['blue', 'green', 'red', 'purple', 'orange', 'cyan', 'magenta', 'yellow']
+
+    # Plot histogram for each distribution with a different color
+    for i, sample in enumerate(samples):
+        color = colors[i % len(colors)]  # Cycle through colors if more distributions than colors
+        axes[i].hist(sample.flatten(), bins=30, color=color, alpha=0.7)
+        axes[i].set_title(f'Distribution {i+1}')
+        axes[i].set_xlabel('Value')
+        axes[i].set_ylabel('Frequency')
+
+    plt.tight_layout()
+    plt.show()
+
+def image_comparison_plot_from_output_dir(
+    output_dir: str,
+    gt_dir: str,
+    fps: int=1,
+    num_split: int=3,
+    output_path: str="comparisons",
+    include_input_imgs: bool=False,
+):
+    # load gt and predicted images
+    gt_imgs = []
+    gen_imgs = []
+    extrinsics = []
+
+    # inside output_dir, read the transforms.json file
+    # these are our PREDICTIONS
+    gen_path = os.path.join(os.getcwd(), output_dir, "transforms.json")
+    with open(gen_path, "r") as f:
+        gen_transforms = json.load(f)
+
+    # inside gt_dir ("input_dir"), read the train_split_{num_split}.json file and transforms.json file
+    # these are our GROUND TRUTH
+    train_split_path = os.path.join(gt_dir, f"train_test_split_{num_split}.json")
+    with open(train_split_path, "r") as f:
+        train_test_split = json.load(f)
+    train_ids = train_test_split["train_ids"]
+    test_ids = train_test_split["test_ids"]
+
+    gt_path = os.path.join(os.getcwd(), gt_dir, "transforms.json")
+    with open(gt_path, "r") as f:
+        gt_transforms = json.load(f)
+
+    gt_applied_transform = gt_transforms.get("applied_transform", None)
+    if gt_applied_transform is not None:
+        gt_applied_transform = np.concatenate([np.array(gt_applied_transform), np.array([0, 0, 0, 1]).reshape(1, 4)])
+
+    # get "file_path" from transforms.json's frames in the order of test_ids
+    gt_imgs = [np.array(plt.imread(os.path.join(gt_dir, gt_transforms["frames"][i]["file_path"]))) for i in test_ids]
+    remaining_tests = len(test_ids)
+
+    print(f"Remaining tests: {remaining_tests}")
+
+    # and then take the "file_path" key from OUTPUT transforms.json (corresponding to inputs)
+    # these are renamed to be sequential, so get the first 'remaining_tests' frames
+    for frame in gen_transforms["frames"]:
+        img_name = frame["file_path"]
+    
+
+        if include_input_imgs: # add input images
+            gen_imgs.append(np.array(plt.imread(os.path.join(output_dir, img_name))))
+        else:
+            if "input" in img_name: # ignore all input images
+                print(f"Ignoring input image: {img_name}")
+                continue
+
+        gen_imgs.append(np.array(plt.imread(os.path.join(output_dir, img_name))))
+        tf_matrix = np.array(frame["transform_matrix"])
+        if gt_applied_transform is not None:
+            tf_matrix = gt_applied_transform @ np.concatenate([tf_matrix, np.array([0, 0, 0, 1]).reshape(1, 4)])
+        extrinsics.append(tf_matrix) # get camera poses from OUTPUT
+        remaining_tests -= 1
+        if remaining_tests <= 0:
+            break
+
+    print("IMAGE COMPARISON STATS:\n")
+    print(len(gt_imgs), gt_imgs[0].shape)
+    print(len(gen_imgs), gen_imgs[0].shape)
+    print(len(extrinsics), extrinsics[0].shape)
+
+    # Center crop all images to ensure they have the same dimensions (outputs are all the same)
+    min_height = gen_transforms["frames"][0]["h"]
+    min_width = gen_transforms["frames"][0]["w"]
+
+    print(f"Target dimensions: {min_height}x{min_width}")
+    print(f"Initial shapes: GT {gt_imgs[0].shape}, Generated {gen_imgs[0].shape}")
+    
+    # # Apply center crop to all GT images
+    # cropped_gt_imgs = []
+    # for img in gt_imgs:
+    #     h, w = img.shape[0], img.shape[1]
+    #     start_h = (h - min_height) // 2
+    #     start_w = (w - min_width) // 2
+    #     cropped = img[start_h:start_h+min_height, start_w:start_w+min_width]
+    #     cropped_gt_imgs.append(cropped)
+    # gt_imgs = cropped_gt_imgs
+
+    # # Apply center crop to all generated images
+    # cropped_gen_imgs = []
+    # for img in gen_imgs:
+    #     h, w = img.shape[0], img.shape[1]
+    #     start_h = (h - min_height) // 2
+    #     start_w = (w - min_width) // 2
+    #     cropped = img[start_h:start_h+min_height, start_w:start_w+min_width]
+    #     cropped_gen_imgs.append(cropped)
+    # gen_imgs = cropped_gen_imgs
+    
+    # print(f"After cropping: GT {gt_imgs[0].shape}, Generated {gen_imgs[0].shape}")
+    
+    # Alternative: Scale GT images to match generated image dimensions
+    scaled_gt_imgs = []
+    for img in gt_imgs:
+        # Use cv2.resize to scale the GT image to match generated image dimensions
+        scaled = cv2.resize(img, (min_width, min_height), interpolation=cv2.INTER_AREA)
+        scaled_gt_imgs.append(scaled)
+    gt_imgs = scaled_gt_imgs
+    print(f"After scaling: GT {gt_imgs[0].shape}, Generated {gen_imgs[0].shape}")
+
+    # hopefull aligned
+
+    # plot the images
+    image_comparison_plot(
+        gt_imgs, 
+        gen_imgs, 
+        extrinsics, 
+        fps=fps, 
+        output_path=output_path
+    )
+    return
+
+def image_comparison_plot(
+    gt_imgs: List[np.ndarray],
+    predicted_imgs: List[np.ndarray],
+    camera_extrinsics: Dict[str, np.ndarray],
+    fps: int=1,
+    output_path=None,
+):
+    # create plot layout
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle('SEVA Img2Img comparison with GTs')
+
+    i = 0
+    im1 = ax1.imshow(predicted_imgs[i], cmap='viridis', vmin=-2, vmax=2)
+    im2 = ax2.imshow(gt_imgs[i], cmap='viridis', vmin=-2, vmax=2)
+    diff = np.abs(predicted_imgs[i] - gt_imgs[i]).mean(axis=-1)
+    im3 = ax3.imshow(diff, cmap='hot', vmin=0, vmax=1)
+
+    ax1.set_title('Generated View')
+    ax2.set_title('Ground Truth')
+    ax3.set_title('Difference')
+    # fig.colorbar(im1, ax=ax1, shrink=0.8)
+    # fig.colorbar(im2, ax=ax2, shrink=0.8)
+    fig.colorbar(im3, ax=ax3, shrink=0.8)
+
+    # what to update per frame
+    def update(frame):
+        pred = predicted_imgs[frame]
+        gt = gt_imgs[frame]
+        diff = np.abs(pred - gt).mean(axis=-1)
+        normed = (diff - diff.min()) / (diff.max() - diff.min())
+        
+        # updates images
+        im1.set_data(pred)
+        im2.set_data(gt)
+        im3.set_data(normed)
+        
+        return im1, im2, im3
+
+    # create animation
+    ani = animation.FuncAnimation(
+        fig=fig,
+        func=update,
+        frames=len(gt_imgs), # num frames = num of comparisons
+        interval=100,  # delay between frames in ms
+        blit=True
+    )
+
+    # save video
+    writer = animation.FFMpegWriter(
+        fps=fps,
+        metadata=dict(artist='Me'),
+        bitrate=1800
+    )
+
+    print("Saving video...")
+    # Use tqdm to show progress for each rendered frame
+    with tqdm(total=len(gt_imgs), ncols=120, miniters=1, desc="Saving video...") as pbar:
+        # Callback function to update progress bar
+        def progress_callback(i, n):
+            pbar.update(1)
+        
+        # Save animation with progress callback
+        ani.save(f"{output_path}.mp4", writer=writer, progress_callback=progress_callback)
+    plt.close()
+
+    print(f"Video saved as {output_path}.mp4")
 
 
 def visualize_camera_poses(
@@ -79,7 +294,7 @@ def visualize_camera_poses(
             camera_names.append(img_name)
             
             # Plot camera direction
-            look_dir = R[:, 2]  # Camera looks along -Z in its own coordinates
+            look_dir = -R[:, 2]  # Camera looks along -Z in its own coordinates
             ax.quiver(camera_pos[0], camera_pos[1], camera_pos[2],
                      look_dir[0] * arrow_length, look_dir[1] * arrow_length, look_dir[2] * arrow_length,
                      color='r', alpha=0.5)
@@ -235,7 +450,20 @@ if __name__ == "__main__":
     parser.add_argument('--transform_coords', type=str, default=None, required=False,
                     help='Converts transforms.json output for SEVA. (Either OPENCV or OPENGL.) Expects a 3x4 numpy array txt file.')
     parser.add_argument('--transforms_path', type=str, default="mvhumannet_format_dir/transforms.json", help="Path to transforms.json file")
+    parser.add_argument('--camera_step', type=int, default=1, help="Step size for plotting camera positions (e.g. 5 means plot every 5th camera)")
+    parser.add_argument('--comparison', action='store_true', help="If true, given a SEVA output strucutred directory, will plot a comparison video of the generated views vs. the ground truth views. Uses the transforms.json file within the directory.")
+    parser.add_argument('--comparison_dir', type=str, default=None, required=False, help="Path to SEVA output directory.")
+    parser.add_argument('--output_path', type=str, default=f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}", required=False, help="Timestep to plot for comparison video.")
+    parser.add_argument('--gt_dir', type=str, default=None, required=False, help="Path to SEVA input directory.")
+    parser.add_argument('--fps', type=int, default=1, required=False, help="FPS of the comparison video.")
+    parser.add_argument('--num_split', type=int, default=3, required=False, help="Number of split for train/test split.")
+    parser.add_argument('--include_input_imgs', action='store_true', default=False, required=False, help="If true, will include input images in the comparison video.")
     args = parser.parse_args()
+
+    if args.comparison:
+        image_comparison_plot_from_output_dir(args.comparison_dir, args.gt_dir, fps=args.fps, num_split=args.num_split, include_input_imgs=args.include_input_imgs, output_path=args.output_path)
+        exit()
+
     camera_scale_path = os.path.join(os.path.dirname(args.transforms_path), "camera_scale.pkl")
     timestep = f"{str(args.timestep).zfill(4)}"
     cam_ex = load_camera_extrinsics(args.transforms_path)
@@ -250,8 +478,8 @@ if __name__ == "__main__":
     cam_ex_scaled = cam_ex
 
     # apply camera scale
-    if "frames" in cam_ex:
-        for frame in cam_ex["frames"]:
+    if "frames" in cam_ex_scaled:
+        for frame in cam_ex_scaled["frames"]:
             for i in range(3):
                 frame["transform_matrix"][i][3] *= cam_scale
     else:  # legacy format
@@ -264,7 +492,10 @@ if __name__ == "__main__":
     else: 
         transform = None
 
-    arrow_length = 200
+    if args.camera_step > 1:
+        cam_ex_scaled["frames"] = cam_ex_scaled["frames"][::args.camera_step]
+
+    arrow_length = 0.1
     if args.timestep > 0: # if connected to a timestep
         visualize_camera_poses(cam_ex_scaled, 
         additional_transform=transform, 
@@ -279,3 +510,4 @@ if __name__ == "__main__":
 # notes
 # Z is height (from this transform)
 # X and Y is the ground plane
+
